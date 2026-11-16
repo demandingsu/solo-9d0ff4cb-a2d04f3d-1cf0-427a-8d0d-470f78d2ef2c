@@ -217,6 +217,38 @@ button.primary:disabled { background: #a8bcc5; cursor: not-allowed; }
 
 .footer { color: var(--muted); font-size: 12px; border-top: 1px solid var(--line); padding-top: 14px; }
 
+/* Impact-list / comparison section */
+.compare-form { margin-top: 14px; }
+.compare-form select {
+  width: 100%;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 13.5px;
+  background: #fff;
+  color: var(--ink);
+}
+
+.impact-table td { white-space: normal; min-width: 150px; }
+.impact-table .arrow { color: var(--muted); margin: 0 4px; font-size: 12px; }
+.impact-table .old-value { color: var(--muted); }
+.impact-table .new-value { font-weight: 600; }
+.impact-table .delta { font-size: 12px; margin-left: 4px; }
+.impact-table .delta-up { color: var(--accent-strong); }
+.impact-table .impact-table .delta-down,
+.impact-table .delta-down { color: var(--error); }
+
+tr.row-added { background: var(--ok-bg) !important; }
+tr.row-removed { background: var(--error-bg) !important; }
+tr.row-unchanged { color: var(--muted); }
+
+.badge-attr-none { background: #eceff2; color: #5b6772; border: 1px solid #cfd8de; }
+.badge-attr-baseline_only { background: #e8f0fb; color: #24508f; border: 1px solid #b9cdf0; }
+.badge-attr-samples_only { background: #efe8fb; color: #5c3a9e; border: 1px solid #d3c2f2; }
+.badge-attr-joint { background: var(--warn-bg); color: var(--warn); border: 1px solid #f0d29b; }
+.badge-attr-unattributable { background: var(--error-bg); color: var(--error); border: 1px solid #f2c3c1; }
+
 @media (max-width: 640px) {
   .card { padding: 16px; }
   .summary { gap: 16px; }

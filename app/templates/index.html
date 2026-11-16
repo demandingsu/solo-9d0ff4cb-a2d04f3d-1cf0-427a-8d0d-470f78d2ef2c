@@ -187,4 +187,97 @@
   {% endif %}
 </section>
 
+<section class="card" id="compare">
+  <h2>4. 报告对照：生成样本级影响清单</h2>
+  <p class="hint">
+    选择<b>旧报告</b>与<b>当前最新、未过期的报告</b>，按样本编号列出新增、移除，以及实测值、
+    占比（或非唯一可达区间）、残差与 SSE 的变化。元素与原矿按名称对齐；名称集合不同则拒绝
+    对照。若两份报告的基准与成品输入都发生了变化，会自动重算两个交叉组合并区分
+    单侧改动、共同影响或无法归因。生成期间若当前输入或最新报告改变，本次清单不会发布；
+    已保存的清单始终按所选报告对可查。
+  </p>
+
+  {% if all_reports|length < 2 %}
+    <p class="empty">至少需要两份报告才能对照。请先替换输入并重新计算。</p>
+  {% else %}
+    {% set latest_id = all_reports[0].id %}
+    {% set latest_fresh = latest_id in fresh_report_ids %}
+    <form method="post" action="/impacts/generate" class="compare-form">
+      <div class="upload-grid">
+        <label class="upload-box">
+          <span class="upload-title">旧报告（任一份更早的报告）</span>
+          <select name="old_report_id" required>
+            {% for item in all_reports %}
+              {% if item.id != latest_id %}
+              <option value="{{ item.id }}">
+                #{{ item.id }} · {{ item.created_at }} · 基准 v{{ item.baseline_version }} ·
+                成品 v{{ item.samples_version }}{% if item.stale %}（已过期）{% endif %}
+              </option>
+              {% endif %}
+            {% endfor %}
+          </select>
+        </label>
+        <label class="upload-box">
+          <span class="upload-title">新报告（当前最新且未过期）</span>
+          <select name="new_report_id" required>
+            {% if latest_fresh %}
+            <option value="{{ latest_id }}">
+              #{{ latest_id }} · {{ all_reports[0].created_at }} ·
+              基准 v{{ all_reports[0].baseline_version }} ·
+              成品 v{{ all_reports[0].samples_version }}
+            </option>
+            {% else %}
+            <option value="" disabled selected>最新报告 #{{ latest_id }} 已过期，请先重新计算</option>
+            {% endif %}
+          </select>
+        </label>
+      </div>
+      <div class="actions">
+        <button type="submit" class="primary" {% if not latest_fresh %}disabled{% endif %}>
+          生成并保存影响清单
+        </button>
+        {% if not latest_fresh %}
+        <span class="hint">最新报告已过期，需先在上方重新计算后才能作为新侧。</span>
+        {% endif %}
+      </div>
+    </form>
+  {% endif %}
+
+  <h3>已保存的影响清单</h3>
+  {% if not saved_impacts %}
+    <p class="empty">尚无已保存的影响清单。</p>
+  {% else %}
+    <div class="table-scroll">
+      <table class="report-table">
+        <thead>
+          <tr>
+            <th>清单编号</th><th>生成时间</th><th>报告对</th>
+            <th>新增</th><th>移除</th><th>共有</th><th>含变化</th>
+            <th>涉及非唯一解</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for item in saved_impacts %}
+          <tr>
+            <td class="sample-id">#{{ item.id }}</td>
+            <td>{{ item.created_at }}</td>
+            <td>报告 #{{ item.old_report_id }} → #{{ item.new_report_id }}</td>
+            <td class="num-cell">{{ item.summary.added }}</td>
+            <td class="num-cell">{{ item.summary.removed }}</td>
+            <td class="num-cell">{{ item.summary.shared }}</td>
+            <td class="num-cell">{{ item.summary.changed }}</td>
+            <td class="num-cell">{{ item.summary.non_unique_pairs }}</td>
+            <td>
+              <a class="link" href="/impacts/{{ item.id }}">查看</a> ·
+              <a class="link" href="/impacts/{{ item.id }}/export.csv">CSV</a>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <p class="hint">已保存清单按所选报告对保存，即使之后输入或最新报告继续变化，内容也不会改变。</p>
+  {% endif %}
+</section>
+
 {% endblock %}

@@ -1,0 +1,35 @@
+{# Renders one change descriptor inside a single table cell. #}
+{% macro render_descriptor(d, is_percent=False) -%}
+{% if d.kind == "range" %}
+  {% if d.old_range is not none %}
+    <span class="range">
+      {% if is_percent %}{{ d.old_range[0]|percent(2) }} ~ {{ d.old_range[1]|percent(2) }}%
+      {% else %}{{ d.old_range[0]|decimal(6) }} ~ {{ d.old_range[1]|decimal(6) }}{% endif %}
+    </span>
+  {% else %}<span class="empty">—</span>{% endif %}
+  <span class="arrow">→</span>
+  {% if d.new_range is not none %}
+    <span class="range">
+      {% if is_percent %}{{ d.new_range[0]|percent(2) }} ~ {{ d.new_range[1]|percent(2) }}%
+      {% else %}{{ d.new_range[0]|decimal(6) }} ~ {{ d.new_range[1]|decimal(6) }}{% endif %}
+    </span>
+  {% else %}<span class="empty">—</span>{% endif %}
+{% else %}
+  {% if d.old is not none %}
+    <span class="{% if d.kind == 'point' %}old-value{% endif %}">
+      {% if is_percent %}{{ d.old|percent(4) }}%{% else %}{{ d.old|decimal(8) }}{% endif %}
+    </span>
+  {% else %}<span class="empty">—</span>{% endif %}
+  <span class="arrow">→</span>
+  {% if d.new is not none %}
+    <span class="new-value">
+      {% if is_percent %}{{ d.new|percent(4) }}%{% else %}{{ d.new|decimal(8) }}{% endif %}
+    </span>
+    {% if d.delta is not none and d.changed %}
+      <span class="delta {% if d.delta.startswith('-') %}delta-down{% else %}delta-up{% endif %}">
+        ({% if is_percent %}{{ d.delta|signed(4) }}%{% else %}{{ d.delta|signed(6) }}{% endif %})
+      </span>
+    {% endif %}
+  {% else %}<span class="empty">—</span>{% endif %}
+{% endif %}
+{%- endmacro %}

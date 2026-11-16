@@ -67,6 +67,24 @@ class ReportRecord:
         return not (self.baseline_is_current and self.samples_is_current)
 
 
+@dataclass(frozen=True)
+class ImpactListRecord:
+    impact_id: int
+    old_report_id: int
+    new_report_id: int
+    created_at: str
+    payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ImpactListSummary:
+    impact_id: int
+    old_report_id: int
+    new_report_id: int
+    created_at: str
+    summary: dict[str, Any]
+
+
 class Store:
     def __init__(self, database_path: str | Path) -> None:
         self.path = Path(database_path)
@@ -119,6 +137,19 @@ class Store:
                         payload           TEXT    NOT NULL,
                         created_at        TEXT    NOT NULL
                     );
+
+                    CREATE TABLE IF NOT EXISTS impact_lists (
+                        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                        old_report_id   INTEGER NOT NULL REFERENCES reports (id),
+                        new_report_id   INTEGER NOT NULL REFERENCES reports (id),
+                        payload         TEXT    NOT NULL,
+                        created_at      TEXT    NOT NULL,
+                        CHECK (old_report_id <> new_report_id)
+                    );
+
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                        impact_lists_pair
+                    ON impact_lists (old_report_id, new_report_id);
                     """
                 )
             except sqlite3.Error as exc:
@@ -351,3 +382,165 @@ class Store:
             == row["baseline_version"],
             samples_is_current=row["current_samples"] == row["samples_version"],
         )
+
+    def list_reports(self) -> list[ReportRecord]:
+        """Every report, newest first, annotated with current-version status."""
+
+        with self._read() as conn:
+            rows = conn.execute(
+                "SELECT r.id, r.baseline_version, r.samples_version, "
+                "       r.payload, r.created_at, "
+                "       (SELECT id FROM input_versions "
+                "         WHERE kind = 'baseline' AND is_current = 1) "
+                "         AS current_baseline, "
+                "       (SELECT id FROM input_versions "
+                "         WHERE kind = 'samples' AND is_current = 1) "
+                "         AS current_samples "
+                "FROM reports r ORDER BY r.id DESC"
+            ).fetchall()
+            return [self._row_to_report(row) for row in rows]
+
+    def get_input_version(self, version_id: int) -> VersionedInput | None:
+        with self._read() as conn:
+            row = conn.execute(
+                "SELECT id, kind, filename, payload, created_at "
+                "FROM input_versions WHERE id = ?",
+                (version_id,),
+            ).fetchone()
+            return self._row_to_input(row) if row else None
+
+    # -- impact lists ----------------------------------------------------
+
+    def save_impact_list(
+        self,
+        old_report_id: int,
+        new_report_id: int,
+        payload: dict[str, Any],
+    ) -> tuple[int | None, bool]:
+        """Persist an impact list, re-checking the publish contract.
+
+        Inside one ``BEGIN IMMEDIATE`` transaction we verify that the new
+        side is still the latest report and is still non-stale (both its
+        input versions current), and that the old report still exists.
+        When the inputs or the latest report changed while the list was
+        being generated, ``(None, False)`` is returned and nothing is
+        written.  A genuine write failure raises :class:`StoreError`,
+        which leaves any previously saved list untouched (the unique pair
+        index plus single-statement upsert makes this atomic).
+
+        Returns ``(impact_id, replaced)`` where ``replaced`` says whether a
+        previously saved list for the same ordered pair was overwritten.
+        """
+
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        try:
+            with self._write() as conn:
+                old_row = conn.execute(
+                    "SELECT id FROM reports WHERE id = ?", (old_report_id,)
+                ).fetchone()
+                new_row = conn.execute(
+                    "SELECT id, baseline_version, samples_version FROM reports "
+                    "WHERE id = ?",
+                    (new_report_id,),
+                ).fetchone()
+                if old_row is None or new_row is None:
+                    return None, False
+
+                latest_id = conn.execute(
+                    "SELECT MAX(id) FROM reports"
+                ).fetchone()[0]
+                if latest_id != new_report_id:
+                    return None, False
+
+                current_baseline = conn.execute(
+                    "SELECT id FROM input_versions "
+                    "WHERE kind = 'baseline' AND is_current = 1"
+                ).fetchone()
+                current_samples = conn.execute(
+                    "SELECT id FROM input_versions "
+                    "WHERE kind = 'samples' AND is_current = 1"
+                ).fetchone()
+                if (
+                    current_baseline is None
+                    or current_samples is None
+                    or current_baseline["id"] != new_row["baseline_version"]
+                    or current_samples["id"] != new_row["samples_version"]
+                ):
+                    return None, False
+
+                previous = conn.execute(
+                    "SELECT id FROM impact_lists "
+                    "WHERE old_report_id = ? AND new_report_id = ?",
+                    (old_report_id, new_report_id),
+                ).fetchone()
+                now = _utcnow()
+                if previous is None:
+                    cursor = conn.execute(
+                        "INSERT INTO impact_lists "
+                        "(old_report_id, new_report_id, payload, created_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (old_report_id, new_report_id, encoded, now),
+                    )
+                    return int(cursor.lastrowid), False
+                conn.execute(
+                    "UPDATE impact_lists SET payload = ?, created_at = ? "
+                    "WHERE id = ?",
+                    (encoded, now, previous["id"]),
+                )
+                return int(previous["id"]), True
+        except sqlite3.Error as exc:
+            raise StoreError(f"保存影响清单失败：{exc}") from exc
+
+    def list_impact_lists(self) -> list[ImpactListSummary]:
+        with self._read() as conn:
+            rows = conn.execute(
+                "SELECT id, old_report_id, new_report_id, created_at, "
+                "       json_extract(payload, '$.summary') AS summary_json "
+                "FROM impact_lists ORDER BY id DESC"
+            ).fetchall()
+            return [
+                ImpactListSummary(
+                    impact_id=row["id"],
+                    old_report_id=row["old_report_id"],
+                    new_report_id=row["new_report_id"],
+                    created_at=row["created_at"],
+                    summary=json.loads(row["summary_json"]),
+                )
+                for row in rows
+            ]
+
+    def get_impact_list(self, impact_id: int) -> ImpactListRecord | None:
+        with self._read() as conn:
+            row = conn.execute(
+                "SELECT id, old_report_id, new_report_id, payload, created_at "
+                "FROM impact_lists WHERE id = ?",
+                (impact_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return ImpactListRecord(
+                impact_id=row["id"],
+                old_report_id=row["old_report_id"],
+                new_report_id=row["new_report_id"],
+                created_at=row["created_at"],
+                payload=json.loads(row["payload"]),
+            )
+
+    def find_impact_list(
+        self, old_report_id: int, new_report_id: int
+    ) -> ImpactListRecord | None:
+        with self._read() as conn:
+            row = conn.execute(
+                "SELECT id, old_report_id, new_report_id, payload, created_at "
+                "FROM impact_lists WHERE old_report_id = ? AND new_report_id = ?",
+                (old_report_id, new_report_id),
+            ).fetchone()
+            if row is None:
+                return None
+            return ImpactListRecord(
+                impact_id=row["id"],
+                old_report_id=row["old_report_id"],
+                new_report_id=row["new_report_id"],
+                created_at=row["created_at"],
+                payload=json.loads(row["payload"]),
+            )

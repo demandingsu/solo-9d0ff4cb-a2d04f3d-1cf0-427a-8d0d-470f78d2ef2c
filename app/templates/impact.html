@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% from "_macros.html" import render_descriptor %}
+{% block title %}影响清单 #{{ impact.id }} - 矿石配料反推{% endblock %}
+{% block content %}
+
+<section class="card" id="impact-head">
+  <div class="report-head">
+    <div>
+      <span class="report-id">样本级影响清单 #{{ impact.id }}</span>
+      <span class="meta">生成于 {{ impact.created_at }} ·
+        对照报告 #{{ impact.old_report_id }} → #{{ impact.new_report_id }}</span>
+    </div>
+    <a class="link" href="/impacts/{{ impact.id }}/export.csv">导出此清单 CSV</a>
+  </div>
+
+  {% set p = impact.payload %}
+  <div class="summary">
+    <div><span class="num">{{ p.summary.added }}</span><span class="lbl">新增样本</span></div>
+    <div><span class="num">{{ p.summary.removed }}</span><span class="lbl">移除样本</span></div>
+    <div><span class="num">{{ p.summary.shared }}</span><span class="lbl">共有样本</span></div>
+    <div><span class="num">{{ p.summary.changed }}</span><span class="lbl">含变化条目</span></div>
+    <div><span class="num">{{ p.summary.non_unique_pairs }}</span><span class="lbl">涉及非唯一解</span></div>
+  </div>
+
+  <ul class="warnings">
+    <li>基准输入：{% if p.baseline_changed %}已更新{% else %}未变化{% endif %}；
+      成品输入：{% if p.samples_changed %}已更新{% else %}未变化{% endif %}。</li>
+    {% if p.both_changed %}
+    <li>两侧输入均已更新，已重算两个交叉组合用于归因：
+      {{ p.crosses.b0s1.label }}、{{ p.crosses.b1s0.label }}。</li>
+    {% endif %}
+    <li>标记为“无法归因”的分量涉及非唯一最优解：只有可达区间，不存在确定占比，
+      不能把区间内任意一组数值当作确定值。</li>
+  </ul>
+  <p><a class="link" href="/#compare">返回对照页面</a></p>
+</section>
+
+<section class="card">
+  <h2>样本级变化明细</h2>
+  <p class="hint">每个单元格为“旧值 → 新值”，括号内为精确差值；非唯一解仅显示可达区间。
+    占比单位为百分比。</p>
+  <div class="table-scroll">
+    <table class="report-table impact-table">
+      <thead>
+        <tr>
+          <th rowspan="2">样本编号</th>
+          <th rowspan="2">状态</th>
+          <th rowspan="2">归因</th>
+          {% for ore in p.ores %}<th>{{ ore }} 占比 旧→新</th>{% endfor %}
+          {% for e in p.elements %}<th>{{ e }} 实测 旧→新</th>{% endfor %}
+          {% for e in p.elements %}<th>{{ e }} 残差 旧→新</th>{% endfor %}
+          <th>SSE 旧→新</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for entry in impact.entries %}
+        <tr class="{% if entry.status == 'added' %}row-added{% elif entry.status == 'removed' %}row-removed{% elif not entry.has_changes %}row-unchanged{% endif %}">
+          <td class="sample-id">{{ entry.sample_id }}</td>
+          <td>
+            {% if entry.status == "added" %}<span class="badge badge-fresh">新增</span>
+            {% elif entry.status == "removed" %}<span class="badge badge-stale">移除</span>
+            {% else %}<span class="badge">共有</span>{% endif %}
+          </td>
+          <td><span class="badge badge-attr-{{ entry.attribution }}">
+            {{ impact.attribution_labels[entry.attribution] }}</span></td>
+          {% for d in entry.weights %}<td class="num-cell">{{ render_descriptor(d, is_percent=True) }}</td>{% endfor %}
+          {% for d in entry.measured %}<td class="num-cell">{{ render_descriptor(d) }}</td>{% endfor %}
+          {% for d in entry.residuals %}<td class="num-cell">{{ render_descriptor(d) }}</td>{% endfor %}
+          <td class="num-cell">{{ render_descriptor(entry.sse) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if impact.hidden_rows %}
+  <p class="hint">仅显示前 {{ impact.entries|length }} 条，其余 {{ impact.hidden_rows }} 条请通过
+    CSV 导出查看。</p>
+  {% endif %}
+</section>
+
+{% endblock %}

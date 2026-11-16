@@ -21,7 +21,14 @@ from starlette.concurrency import run_in_threadpool
 
 from . import formatting
 from .compute import ComputeError, compute_report
-from .db import ReportRecord, Store, StoreError, VersionedInput
+from .db import (
+    ImpactListRecord,
+    ReportRecord,
+    Store,
+    StoreError,
+    VersionedInput,
+)
+from .diff import ATTRIBUTION_LABELS, DiffError, build_impact_list
 from .inputs import (
     MAX_UPLOAD_BYTES,
     BaselineInput,
@@ -33,6 +40,7 @@ from .inputs import (
 
 BASE_DIR = Path(__file__).resolve().parent
 REPORT_ROW_LIMIT = 500
+IMPACT_ROW_LIMIT = 500
 
 
 def create_app(database_path: str | None = None) -> FastAPI:
@@ -118,15 +126,46 @@ def create_app(database_path: str | None = None) -> FastAPI:
             "hidden_rows": max(0, len(rows) - len(visible)),
         }
 
+    def impact_view(record: ImpactListRecord | None) -> dict[str, Any] | None:
+        if record is None:
+            return None
+        entries = record.payload.get("entries", [])
+        visible = entries[:IMPACT_ROW_LIMIT]
+        return {
+            "id": record.impact_id,
+            "created_at": record.created_at,
+            "old_report_id": record.old_report_id,
+            "new_report_id": record.new_report_id,
+            "payload": record.payload,
+            "entries": visible,
+            "hidden_rows": max(0, len(entries) - len(visible)),
+            "attribution_labels": ATTRIBUTION_LABELS,
+        }
+
     def context(request: Request) -> dict[str, Any]:
         current = store.current_inputs()
         record = store.latest_report()
+        all_reports = store.list_reports()
+        fresh_reports = [item for item in all_reports if not item.is_stale]
+        saved_impacts = store.list_impact_lists()
         return {
             "request": request,
             "current": {
                 kind: input_summary(value) for kind, value in current.items()
             },
             "report": report_view(record),
+            "all_reports": [report_view(item) for item in all_reports],
+            "fresh_report_ids": {item.report_id for item in fresh_reports},
+            "saved_impacts": [
+                {
+                    "id": item.impact_id,
+                    "old_report_id": item.old_report_id,
+                    "new_report_id": item.new_report_id,
+                    "created_at": item.created_at,
+                    "summary": item.summary,
+                }
+                for item in saved_impacts
+            ],
             "notice": request.query_params.get("notice"),
             "notice_kind": request.query_params.get("notice_kind", "ok"),
             "max_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024),
@@ -214,6 +253,14 @@ def create_app(database_path: str | None = None) -> FastAPI:
             request, "index.html", ctx, status_code=400
         )
 
+    def _render_impact_error(request: Request, message: str) -> HTMLResponse:
+        ctx = context(request)
+        ctx["notice"] = message
+        ctx["notice_kind"] = "error"
+        return templates.TemplateResponse(
+            request, "index.html", ctx, status_code=400
+        )
+
     @app.post("/compute")
     async def compute(request: Request) -> Response:
         snapshot = await run_in_threadpool(store.snapshot)
@@ -258,6 +305,130 @@ def create_app(database_path: str | None = None) -> FastAPI:
             f"{payload['non_unique_count']} 个无法唯一确定）。",
             "ok",
             "report",
+        )
+
+    # -- impact lists ----------------------------------------------------
+
+    @app.post("/impacts/generate")
+    async def generate_impact(request: Request) -> Response:
+        form = await request.form()
+        try:
+            old_id = int(str(form.get("old_report_id", "")).strip())
+            new_id = int(str(form.get("new_report_id", "")).strip())
+        except (TypeError, ValueError):
+            return _render_impact_error(request, "请选择旧报告与新报告后再生成。")
+
+        try:
+            old_record, new_record = await run_in_threadpool(
+                _load_report_pair, store, old_id, new_id
+            )
+        except DiffError as exc:
+            return _render_impact_error(request, str(exc))
+
+        if new_record.is_stale:
+            return _render_impact_error(
+                request,
+                "新报告已过期（其基准或成品输入已被替换），不能作为对照的新侧；"
+                "请先基于当前输入计算最新报告。",
+            )
+        latest = await run_in_threadpool(store.latest_report)
+        if latest is None or latest.report_id != new_id:
+            return _render_impact_error(
+                request,
+                f"报告 #{new_id} 已不是最新报告；新侧必须是当前最新、未过期的报告，"
+                "请刷新页面后重新选择。",
+            )
+
+        baseline_changed = (
+            new_record.baseline_version != old_record.baseline_version
+        )
+        samples_changed = (
+            new_record.samples_version != old_record.samples_version
+        )
+        if not baseline_changed and not samples_changed:
+            return _render_impact_error(
+                request, "两份报告来自完全相同的输入版本，没有可对照的变化。"
+            )
+
+        old_baseline = old_samples = new_baseline = new_samples = None
+        if baseline_changed and samples_changed:
+            try:
+                snapshots = await run_in_threadpool(
+                    _load_four_inputs,
+                    store,
+                    old_record,
+                    new_record,
+                )
+            except DiffError as exc:
+                return _render_impact_error(request, str(exc))
+            old_baseline, old_samples, new_baseline, new_samples = snapshots
+
+        try:
+            payload = await run_in_threadpool(
+                build_impact_list,
+                old_id,
+                new_id,
+                old_record.payload,
+                new_record.payload,
+                baseline_changed=baseline_changed,
+                samples_changed=samples_changed,
+                old_baseline=old_baseline,
+                old_samples=old_samples,
+                new_baseline=new_baseline,
+                new_samples=new_samples,
+            )
+        except DiffError as exc:
+            return _render_impact_error(request, str(exc))
+
+        try:
+            saved = await run_in_threadpool(
+                store.save_impact_list, old_id, new_id, payload
+            )
+        except StoreError as exc:
+            return _render_impact_error(
+                request, f"影响清单写入失败，已保存的清单保持不变：{exc}"
+            )
+
+        impact_id, replaced = saved
+        if impact_id is None:
+            return _render_impact_error(
+                request,
+                "生成期间当前输入或最新报告发生了变化，本次清单针对的新侧已失效，"
+                "已丢弃且未发布。请基于最新报告重新生成。",
+            )
+
+        verb = "已更新" if replaced else "已生成并保存"
+        return redirect_notice(
+            f"样本级影响清单 #{impact_id} {verb}（报告 #{old_id} → #{new_id}，"
+            f"新增 {payload['summary']['added']}、移除 "
+            f"{payload['summary']['removed']}、变化 "
+            f"{payload['summary']['changed']}）。",
+            "ok",
+            f"impact-{impact_id}",
+        )
+
+    @app.get("/impacts/{impact_id}", response_class=HTMLResponse)
+    def impact_detail(request: Request, impact_id: int) -> Response:
+        record = store.get_impact_list(impact_id)
+        if record is None:
+            return PlainTextResponse("影响清单不存在", status_code=404)
+        ctx = context(request)
+        ctx["impact"] = impact_view(record)
+        return templates.TemplateResponse(request, "impact.html", ctx)
+
+    @app.get("/impacts/{impact_id}/export.csv")
+    def impact_export(impact_id: int) -> Response:
+        record = store.get_impact_list(impact_id)
+        if record is None:
+            return PlainTextResponse("影响清单不存在", status_code=404)
+        return Response(
+            "﻿" + build_impact_csv(record) + "\r\n",
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="ore-impact-{impact_id}.csv"'
+                )
+            },
         )
 
     # -- exports ---------------------------------------------------------
@@ -417,6 +588,153 @@ def _csv_cell(value: Any) -> str:
     if any(ch in text for ch in [",", '"', "\r", "\n"]):
         return '"' + text.replace('"', '""') + '"'
     return text
+
+
+def _load_report_pair(
+    store: Store, old_id: int, new_id: int
+) -> tuple[ReportRecord, ReportRecord]:
+    old_record = store.get_report(old_id)
+    new_record = store.get_report(new_id)
+    if old_record is None or new_record is None:
+        raise DiffError("所选报告不存在，请刷新页面后重新选择。")
+    if old_id == new_id:
+        raise DiffError("旧报告与新报告不能选择同一份报告。")
+    return old_record, new_record
+
+
+def _load_four_inputs(
+    store: Store, old_record: ReportRecord, new_record: ReportRecord
+) -> tuple[BaselineInput, SamplesInput, BaselineInput, SamplesInput]:
+    """Fetch every input snapshot needed for the two cross combinations."""
+
+    versions = {
+        "old_baseline": old_record.baseline_version,
+        "old_samples": old_record.samples_version,
+        "new_baseline": new_record.baseline_version,
+        "new_samples": new_record.samples_version,
+    }
+    rows = {name: store.get_input_version(version) for name, version in versions.items()}
+    missing = [name for name, row in rows.items() if row is None]
+    if missing:
+        raise DiffError("报告引用的输入版本已不存在，无法重算交叉组合。")
+    return (
+        BaselineInput.from_payload(rows["old_baseline"].payload),
+        SamplesInput.from_payload(rows["old_samples"].payload),
+        BaselineInput.from_payload(rows["new_baseline"].payload),
+        SamplesInput.from_payload(rows["new_samples"].payload),
+    )
+
+
+_STATUS_LABELS = {
+    "added": "新增",
+    "removed": "移除",
+    "common": "共有",
+}
+
+
+def _descriptor_cells(descriptor: dict[str, Any]) -> list[str]:
+    """Render one change descriptor as CSV cells.
+
+    Non-unique optima are emitted as ranges only – never as a chosen
+    proportion – on both the old and new side.
+    """
+
+    attribution = ATTRIBUTION_LABELS[descriptor["attribution"]]
+    if descriptor["kind"] == "range":
+        old_range = descriptor["old_range"]
+        new_range = descriptor["new_range"]
+        old_text = (
+            ""
+            if old_range is None
+            else f"{formatting.decimal(old_range[0], 10)} ~ "
+            f"{formatting.decimal(old_range[1], 10)}"
+        )
+        new_text = (
+            ""
+            if new_range is None
+            else f"{formatting.decimal(new_range[0], 10)} ~ "
+            f"{formatting.decimal(new_range[1], 10)}"
+        )
+        return [old_text, new_text, "", attribution]
+
+    old_value = descriptor["old"]
+    new_value = descriptor["new"]
+    delta = descriptor["delta"]
+    return [
+        "" if old_value is None else formatting.decimal(old_value, 10),
+        "" if new_value is None else formatting.decimal(new_value, 10),
+        "" if delta is None else formatting.decimal(delta, 10),
+        attribution,
+    ]
+
+
+def build_impact_csv(record: ImpactListRecord) -> str:
+    payload = record.payload
+    elements = payload["elements"]
+    ores = payload["ores"]
+
+    header = [
+        "sample_id",
+        "status",
+        "attribution",
+        "changed",
+    ]
+    for ore in ores:
+        header += [
+            f"weight_{ore}_old",
+            f"weight_{ore}_new",
+            f"weight_{ore}_delta",
+            f"weight_{ore}_attribution",
+        ]
+    for element in elements:
+        header += [
+            f"measured_{element}_old",
+            f"measured_{element}_new",
+            f"measured_{element}_delta",
+            f"measured_{element}_attribution",
+        ]
+    for element in elements:
+        header += [
+            f"predicted_{element}_old",
+            f"predicted_{element}_new",
+            f"predicted_{element}_delta",
+            f"predicted_{element}_attribution",
+        ]
+    for element in elements:
+        header += [
+            f"residual_{element}_old",
+            f"residual_{element}_new",
+            f"residual_{element}_delta",
+            f"residual_{element}_attribution",
+        ]
+    header += ["sse_old", "sse_new", "sse_delta", "sse_attribution"]
+
+    lines = [",".join(_csv_cell(cell) for cell in header)]
+    for entry in payload["entries"]:
+        row = [
+            entry["sample_id"],
+            _STATUS_LABELS[entry["status"]],
+            ATTRIBUTION_LABELS[entry["attribution"]],
+            "yes" if entry["has_changes"] else "no",
+        ]
+        for descriptor in entry["weights"]:
+            cells = _descriptor_cells(descriptor)
+            if descriptor["kind"] == "point" and cells[0]:
+                cells[0] = formatting.percent(descriptor["old"], 8)
+            if descriptor["kind"] == "point" and cells[1]:
+                cells[1] = formatting.percent(descriptor["new"], 8)
+            if descriptor["kind"] == "point" and cells[2]:
+                cells[2] = formatting.percent(descriptor["delta"], 8)
+            row += cells
+        for descriptor in entry["measured"]:
+            row += _descriptor_cells(descriptor)
+        for descriptor in entry["predicted"]:
+            row += _descriptor_cells(descriptor)
+        for descriptor in entry["residuals"]:
+            row += _descriptor_cells(descriptor)
+        row += _descriptor_cells(entry["sse"])
+        lines.append(",".join(_csv_cell(cell) for cell in row))
+    return "\r\n".join(lines)
 
 
 class _LabeledError(Exception):
